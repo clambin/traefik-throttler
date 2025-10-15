@@ -1,0 +1,6 @@
+displayName: Throttler Middleware Plugin
+type: middleware
+
+import: github.com/clambin/throttler
+
+summary: "This middleware throttles clients that generate excessive 404 errors."
