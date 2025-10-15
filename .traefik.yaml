@@ -4,3 +4,7 @@ type: middleware
 import: github.com/clambin/traefik-throttler
 
 summary: "This middleware throttles clients that generate excessive 404 errors."
+
+testData:
+  Rate: 100
+  Capacity: 50
