@@ -1,4 +1,4 @@
-package throttler
+package traefik_throttler
 
 import (
 	"context"
