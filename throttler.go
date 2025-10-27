@@ -22,9 +22,9 @@ const (
 
 // Config holds the plugin configuration.
 type Config struct {
+	Log      LogConfig `json:"log"`
 	Rate     float64   `json:"rate"`
 	Capacity int       `json:"capacity"`
-	Log      LogConfig `json:"log"`
 }
 
 type LogConfig struct {
@@ -67,15 +67,19 @@ func CreateConfig() *Config {
 	}
 }
 
+var _ http.Handler = (*Throttler)(nil)
+
 // Throttler is a Traefik middleware that throttles requests for clients that generate too many 404 errors.
 type Throttler struct {
 	logger   *slog.Logger
 	hosts    map[string]*clientThrottler
+	next     http.Handler
 	lock     sync.Mutex
 	interval time.Duration
 	capacity int
 }
 
+// clientThrottler is a rate limiter for a single client.
 type clientThrottler struct {
 	rateLimiter *rateLimiter
 	cancel      context.CancelFunc
@@ -93,34 +97,44 @@ func New(ctx context.Context, next http.Handler, config *Config, _ string) (http
 		hosts:    make(map[string]*clientThrottler),
 		interval: config.interval(),
 		capacity: config.Capacity,
+		next:     next,
 	}
 	go t.purgeExpiredClientThrottlers(ctx)
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		l := t.logger.With(
-			slog.String("remoteAddr", r.RemoteAddr),
-			slog.String("path", r.URL.Path),
-		)
-		l.Debug("throttler: new request")
-		b := t.getHostThrottler(ctx, r.RemoteAddr)
-		if !b.rateLimiter.acquire() {
-			l.Warn("throttler: request throttled")
-			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
-			return
-		}
-		lw := logWriterRecorder{ResponseWriter: w}
-		next.ServeHTTP(&lw, r)
-		if lw.status != http.StatusNotFound {
-			b.rateLimiter.release()
-		}
-		l.Debug("throttler: request completed",
-			slog.Int("statusCode", lw.status),
-			slog.Int("tokens", b.rateLimiter.tokenCount()),
-		)
-	}), nil
+	return &t, nil
 }
 
-func (t *Throttler) getHostThrottler(ctx context.Context, host string) *clientThrottler {
+// ServeHTTP implements the http.Handler interface.
+// It throttles requests for clients that generate too many 404 errors.
+func (t *Throttler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	l := t.logger.With(
+		slog.String("remoteAddr", r.RemoteAddr),
+		slog.String("path", r.URL.Path),
+	)
+	l.Debug("throttler: new request")
+	// start (or get) the clientThrottler for the current client.  We use r.Context() here to ensure that
+	// the clientThrottler is canceled (stopped) when the request's connection is closed.
+	ct := t.getClientThrottler(r.Context(), r.RemoteAddr)
+	// get a token from the clientThrottler.  If the token is not available, return a 429.
+	if !ct.rateLimiter.acquire() {
+		l.Warn("throttler: request throttled")
+		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+		return
+	}
+	// we're not throttled.  Perform the request.
+	lw := logWriterRecorder{ResponseWriter: w}
+	t.next.ServeHTTP(&lw, r)
+	// if the request was successful, release the token.
+	if lw.status != http.StatusNotFound {
+		ct.rateLimiter.release()
+	}
+	l.Debug("throttler: request completed",
+		slog.Int("statusCode", lw.status),
+		slog.Int("tokens", ct.rateLimiter.tokenCount()),
+	)
+}
+
+func (t *Throttler) getClientThrottler(ctx context.Context, host string) *clientThrottler {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	b, ok := t.hosts[host]
@@ -175,28 +189,26 @@ func (r *logWriterRecorder) WriteHeader(status int) {
 // Unlike a normal token bucket, it does not block when the bucket is empty, as we only use it to
 // decide whether to throttle requests.
 type rateLimiter struct {
-	lock     sync.Mutex
+	lock     sync.RWMutex
 	tokens   int
 	capacity int
 }
 
 func newRateLimiter(ctx context.Context, capacity int, interval time.Duration) *rateLimiter {
-	rl := rateLimiter{tokens: capacity, capacity: capacity}
-	go rl.refill(ctx, interval)
-	return &rl
-}
-
-func (r *rateLimiter) refill(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			r.release()
+	r := rateLimiter{tokens: capacity, capacity: capacity}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.release()
+			}
 		}
-	}
+	}()
+	return &r
 }
 
 func (r *rateLimiter) acquire() bool {
@@ -218,7 +230,7 @@ func (r *rateLimiter) release() {
 }
 
 func (r *rateLimiter) tokenCount() int {
-	r.lock.Lock()
-	defer r.lock.Unlock()
+	r.lock.RLock()
+	defer r.lock.RUnlock()
 	return r.tokens
 }

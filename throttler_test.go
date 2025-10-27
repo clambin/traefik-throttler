@@ -2,6 +2,7 @@ package traefik_throttler
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -42,7 +43,7 @@ func TestConfig_logger(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := Config{Log: tt.cfg}.logger(nil)
+			_, err := Config{Log: tt.cfg}.logger(io.Discard)
 			if (err != nil) == tt.wantErr {
 				t.Errorf("logger() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -188,7 +189,7 @@ func BenchmarkThrottler(b *testing.B) {
 	b.ReportAllocs()
 	h := handler(http.StatusNotFound)
 	ctx := b.Context()
-	throttler, err := New(ctx, h, config(10001, 1, "error"), "")
+	throttler, err := New(ctx, h, config(10_000, 1, "error"), "")
 	if err != nil {
 		b.Fatal(err)
 	}
