@@ -2,6 +2,7 @@ package traefik_throttler
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -124,7 +125,7 @@ func TestThrottler_Expiration(t *testing.T) {
 }
 
 func send(ctx context.Context, h http.Handler, clientAddr string) int {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080", nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080/", nil)
 	req.RemoteAddr = clientAddr
 	resp := httptest.NewRecorder()
 	h.ServeHTTP(resp, req)
@@ -165,7 +166,7 @@ func BenchmarkThrottler(b *testing.B) {
 	b.ReportAllocs()
 	h := handler(http.StatusNotFound)
 	ctx := b.Context()
-	throttler, err := New(ctx, h, &Config{Capacity: 1000, Rate: time.Second}, "")
+	throttler, err := New(ctx, h, &Config{Capacity: 1000, Rate: time.Second, Log: LogConfig{Level: slog.LevelError}}, "")
 	if err != nil {
 		b.Fatal(err)
 	}
