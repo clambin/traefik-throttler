@@ -1,7 +1,6 @@
 package traefik_throttler
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -34,7 +33,10 @@ type LogConfig struct {
 }
 
 func (c Config) interval() time.Duration {
-	return time.Duration(float64(time.Second) / cmp.Or(c.Rate, 1.0))
+	if c.Rate == 0 {
+		c.Rate = 1.0
+	}
+	return time.Duration(float64(time.Second) / c.Rate)
 }
 
 func (c Config) logger(w io.Writer) (*slog.Logger, error) {
