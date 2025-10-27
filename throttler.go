@@ -1,7 +1,10 @@
 package traefik_throttler
 
 import (
+	"cmp"
 	"context"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,33 +16,41 @@ import (
 const (
 	expireClientThrottlersInterval = 5 * time.Minute
 	defaultCapacity                = 50
-	defaultRate                    = 10 * time.Millisecond
-	defaultLogLevel                = slog.LevelInfo
+	defaultRate                    = 10
+	defaultLogLevel                = "info"
 	defaultLogFormat               = "json"
 )
 
 // Config holds the plugin configuration.
 type Config struct {
-	Rate     time.Duration `json:"rate"`
-	Capacity int           `json:"capacity"`
-	Log      LogConfig     `json:"log"`
+	Rate     float64   `json:"rate"`
+	Capacity int       `json:"capacity"`
+	Log      LogConfig `json:"log"`
 }
 
 type LogConfig struct {
-	Level  slog.Level `json:"level"`
-	Format string     `json:"format"`
+	Level  string `json:"level"`
+	Format string `json:"format"`
 }
 
-func (c LogConfig) Logger() *slog.Logger {
-	opts := slog.HandlerOptions{Level: c.Level}
-	var h slog.Handler
-	switch strings.ToLower(c.Format) {
-	case "json":
-		h = slog.NewJSONHandler(os.Stdout, &opts)
-	default:
-		h = slog.NewTextHandler(os.Stdout, &opts)
+func (c Config) interval() time.Duration {
+	return time.Duration(float64(time.Second) / cmp.Or(c.Rate, 1.0))
+}
+
+func (c Config) logger(w io.Writer) (*slog.Logger, error) {
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(c.Log.Level)); err != nil {
+		return nil, err
 	}
-	return slog.New(h)
+	opts := slog.HandlerOptions{Level: lvl}
+	var h slog.Handler
+	switch strings.ToLower(c.Log.Format) {
+	case "json":
+		h = slog.NewJSONHandler(w, &opts)
+	default:
+		h = slog.NewTextHandler(w, &opts)
+	}
+	return slog.New(h), nil
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -56,10 +67,11 @@ func CreateConfig() *Config {
 
 // Throttler is a Traefik middleware that throttles requests for clients that generate too many 404 errors.
 type Throttler struct {
-	cfg    *Config
-	logger *slog.Logger
-	hosts  map[string]*clientThrottler
-	lock   sync.Mutex
+	logger   *slog.Logger
+	hosts    map[string]*clientThrottler
+	lock     sync.Mutex
+	interval time.Duration
+	capacity int
 }
 
 type clientThrottler struct {
@@ -70,10 +82,15 @@ type clientThrottler struct {
 
 // New creates a new instance of the middleware.
 func New(ctx context.Context, next http.Handler, config *Config, _ string) (http.Handler, error) {
+	logger, err := config.logger(os.Stdout)
+	if err != nil {
+		return nil, fmt.Errorf("slog: %w", err)
+	}
 	t := Throttler{
-		cfg:    config,
-		logger: config.Log.Logger(),
-		hosts:  make(map[string]*clientThrottler),
+		logger:   logger,
+		hosts:    make(map[string]*clientThrottler),
+		interval: config.interval(),
+		capacity: config.Capacity,
 	}
 	go t.purgeExpiredClientThrottlers(ctx)
 
@@ -91,10 +108,13 @@ func New(ctx context.Context, next http.Handler, config *Config, _ string) (http
 		}
 		lw := logWriterRecorder{ResponseWriter: w}
 		next.ServeHTTP(&lw, r)
-		l.Debug("throttler: request completed", slog.Int("statusCode", lw.status))
 		if lw.status != http.StatusNotFound {
 			b.rateLimiter.release()
 		}
+		l.Debug("throttler: request completed",
+			slog.Int("statusCode", lw.status),
+			slog.Int("tokens", b.rateLimiter.tokenCount()),
+		)
 	}), nil
 }
 
@@ -106,7 +126,7 @@ func (t *Throttler) getHostThrottler(ctx context.Context, host string) *clientTh
 		t.logger.Debug("throttler: new client", slog.String("host", host))
 		subCtx, cancel := context.WithCancel(ctx)
 		b = &clientThrottler{
-			rateLimiter: newRateLimiter(subCtx, t.cfg.Capacity, t.cfg.Rate),
+			rateLimiter: newRateLimiter(subCtx, t.capacity, t.interval),
 			cancel:      cancel,
 		}
 		t.hosts[host] = b
@@ -158,9 +178,9 @@ type rateLimiter struct {
 	capacity int
 }
 
-func newRateLimiter(ctx context.Context, capacity int, rate time.Duration) *rateLimiter {
+func newRateLimiter(ctx context.Context, capacity int, interval time.Duration) *rateLimiter {
 	rl := rateLimiter{tokens: capacity, capacity: capacity}
-	go rl.refill(ctx, rate)
+	go rl.refill(ctx, interval)
 	return &rl
 }
 
@@ -193,4 +213,10 @@ func (r *rateLimiter) release() {
 	if r.tokens < r.capacity {
 		r.tokens++
 	}
+}
+
+func (r *rateLimiter) tokenCount() int {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	return r.tokens
 }
