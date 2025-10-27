@@ -69,16 +69,13 @@ func CreateConfig() *Config {
 	}
 }
 
-var _ http.Handler = (*Throttler)(nil)
-
-// Throttler is a Traefik middleware that throttles requests for clients that generate too many 404 errors.
+// Throttler is a Traefik plugin that throttles requests for clients that generate too many 404 errors.
 type Throttler struct {
-	logger   *slog.Logger
-	hosts    map[string]*clientThrottler
-	next     http.Handler
-	lock     sync.Mutex
-	interval time.Duration
-	capacity int
+	logger           *slog.Logger
+	clientThrottlers map[string]*clientThrottler
+	lock             sync.Mutex
+	interval         time.Duration
+	capacity         int
 }
 
 // clientThrottler is a rate limiter for a single client.
@@ -95,62 +92,59 @@ func New(ctx context.Context, next http.Handler, config *Config, _ string) (http
 		return nil, fmt.Errorf("slog: %w", err)
 	}
 	t := Throttler{
-		logger:   logger,
-		hosts:    make(map[string]*clientThrottler),
-		interval: config.interval(),
-		capacity: config.Capacity,
-		next:     next,
+		logger:           logger,
+		clientThrottlers: make(map[string]*clientThrottler),
+		interval:         config.interval(),
+		capacity:         config.Capacity,
 	}
 	go t.purgeExpiredClientThrottlers(ctx)
 
-	return &t, nil
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		l := t.logger.With(
+			slog.String("remoteAddr", r.RemoteAddr),
+			slog.String("path", r.URL.Path),
+		)
+		l.Debug("throttler: new request")
+		// start (or get) the clientThrottler for the current client.  We don't use r.Context() here to ensure that
+		// the clientThrottler continues to fill the bucket even if the connection is closed.
+		ct := t.getClientThrottler(ctx, r.RemoteAddr)
+		// get a token from the clientThrottler.  If the token is not available, return a 429.
+		if !ct.rateLimiter.TryAcquire() {
+			l.Warn("throttler: request throttled")
+			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+			return
+		}
+		// we're not throttled.  Perform the request.
+		lw := logWriterRecorder{ResponseWriter: w}
+		next.ServeHTTP(&lw, r)
+		// if the request was successful, release the token.
+		if lw.status != http.StatusNotFound {
+			ct.rateLimiter.Release()
+		}
+		l.Debug("throttler: request completed",
+			slog.Int("statusCode", lw.status),
+			slog.Int("tokens", ct.rateLimiter.TokenCount()),
+		)
+	})
+
+	return h, nil
 }
 
-// ServeHTTP implements the http.Handler interface.
-// It throttles requests for clients that generate too many 404 errors.
-func (t *Throttler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	l := t.logger.With(
-		slog.String("remoteAddr", r.RemoteAddr),
-		slog.String("path", r.URL.Path),
-	)
-	l.Debug("throttler: new request")
-	// start (or get) the clientThrottler for the current client.  We use r.Context() here to ensure that
-	// the clientThrottler is canceled (stopped) when the request's connection is closed.
-	ct := t.getClientThrottler(r.Context(), r.RemoteAddr)
-	// get a token from the clientThrottler.  If the token is not available, return a 429.
-	if !ct.rateLimiter.TryAcquire() {
-		l.Warn("throttler: request throttled")
-		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
-		return
-	}
-	// we're not throttled.  Perform the request.
-	lw := logWriterRecorder{ResponseWriter: w}
-	t.next.ServeHTTP(&lw, r)
-	// if the request was successful, release the token.
-	if lw.status != http.StatusNotFound {
-		ct.rateLimiter.Release()
-	}
-	l.Debug("throttler: request completed",
-		slog.Int("statusCode", lw.status),
-		slog.Int("tokens", ct.rateLimiter.TokenCount()),
-	)
-}
-
-func (t *Throttler) getClientThrottler(ctx context.Context, host string) *clientThrottler {
+func (t *Throttler) getClientThrottler(ctx context.Context, remoteAddr string) *clientThrottler {
 	t.lock.Lock()
 	defer t.lock.Unlock()
-	b, ok := t.hosts[host]
+	ct, ok := t.clientThrottlers[remoteAddr]
 	if !ok {
-		t.logger.Debug("throttler: new client", slog.String("host", host))
+		t.logger.Debug("throttler: new client", slog.String("remoteAddr", remoteAddr))
 		subCtx, cancel := context.WithCancel(ctx)
-		b = &clientThrottler{
+		ct = &clientThrottler{
 			rateLimiter: ratelimiter.New(subCtx, t.interval, t.capacity),
 			cancel:      cancel,
 		}
-		t.hosts[host] = b
+		t.clientThrottlers[remoteAddr] = ct
 	}
-	b.lastWritten = time.Now()
-	return b
+	ct.lastWritten = time.Now()
+	return ct
 }
 
 func (t *Throttler) purgeExpiredClientThrottlers(ctx context.Context) {
@@ -162,11 +156,11 @@ func (t *Throttler) purgeExpiredClientThrottlers(ctx context.Context) {
 			return
 		case <-ticker.C:
 			t.lock.Lock()
-			for host, b := range t.hosts {
-				if time.Since(b.lastWritten) > expireClientThrottlersInterval {
+			for host, ct := range t.clientThrottlers {
+				if time.Since(ct.lastWritten) > expireClientThrottlersInterval {
 					t.logger.Debug("throttler: expired client", slog.String("host", host))
-					b.cancel()
-					delete(t.hosts, host)
+					ct.cancel()
+					delete(t.clientThrottlers, host)
 				}
 			}
 			t.lock.Unlock()

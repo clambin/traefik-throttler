@@ -56,7 +56,7 @@ func TestThrottler(t *testing.T) {
 	h := handler(http.StatusNotFound)
 
 	const tokens = 5
-	throttler, err := New(ctx, h, config(tokens, 0.1, "debug"), "")
+	throttler, err := New(ctx, h, config(tokens, 0.1, "error"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestThrottler_Expiration(t *testing.T) {
 			expirationInterval = time.Second
 		)
 
-		throttler, err := New(ctx, h, config(tokens, 1/expirationInterval.Seconds(), ""), "")
+		throttler, err := New(ctx, h, config(tokens, 1/expirationInterval.Seconds(), "error"), "")
 		if err != nil {
 			t.Fatal(err)
 		}
