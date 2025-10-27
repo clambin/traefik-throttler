@@ -161,30 +161,6 @@ func TestThrottler_Expiration(t *testing.T) {
 	})
 }
 
-func Test_rateLimiter(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		const tokens = 10
-		ctx := t.Context()
-		b := newRateLimiter(ctx, tokens, time.Second)
-		// acquire all available tokens
-		for range tokens {
-			if !b.acquire() {
-				t.Fatal("expected no error")
-			}
-		}
-		// acquire one more token, should fail
-		if b.acquire() {
-			t.Fatal("expected error")
-		}
-		// wait for tokens to be refilled
-		time.Sleep(2 * time.Second)
-		// acquire one more token, should succeed
-		if !b.acquire() {
-			t.Fatal("expected no error")
-		}
-	})
-}
-
 func BenchmarkThrottler(b *testing.B) {
 	b.ReportAllocs()
 	h := handler(http.StatusNotFound)

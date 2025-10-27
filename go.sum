@@ -1,0 +1,4 @@
+codeberg.org/clambin/ratelimiter v0.0.0-20251027202230-451ff89dcb00 h1:vD0Ypl7ss9RfXux/3jgEV3HMv2FcZ/LTKdhMhbdrhN4=
+codeberg.org/clambin/ratelimiter v0.0.0-20251027202230-451ff89dcb00/go.mod h1:rFBDKUf8BlRaZ5edNK5gtK22Mx7chtkwRTM0wiiDCw8=
+codeberg.org/clambin/ratelimiter v0.1.0 h1:pkZYLErjZBuNYnrDLzhZ1rdgkRonf4RkGvWGF6fDWAg=
+codeberg.org/clambin/ratelimiter v0.1.0/go.mod h1:rFBDKUf8BlRaZ5edNK5gtK22Mx7chtkwRTM0wiiDCw8=

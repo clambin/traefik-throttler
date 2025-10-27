@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"codeberg.org/clambin/ratelimiter"
 )
 
 const (
@@ -81,7 +83,7 @@ type Throttler struct {
 
 // clientThrottler is a rate limiter for a single client.
 type clientThrottler struct {
-	rateLimiter *rateLimiter
+	rateLimiter *ratelimiter.RateLimiter
 	cancel      context.CancelFunc
 	lastWritten time.Time
 }
@@ -116,7 +118,7 @@ func (t *Throttler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the clientThrottler is canceled (stopped) when the request's connection is closed.
 	ct := t.getClientThrottler(r.Context(), r.RemoteAddr)
 	// get a token from the clientThrottler.  If the token is not available, return a 429.
-	if !ct.rateLimiter.acquire() {
+	if !ct.rateLimiter.TryAcquire() {
 		l.Warn("throttler: request throttled")
 		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
 		return
@@ -126,11 +128,11 @@ func (t *Throttler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	t.next.ServeHTTP(&lw, r)
 	// if the request was successful, release the token.
 	if lw.status != http.StatusNotFound {
-		ct.rateLimiter.release()
+		ct.rateLimiter.Release()
 	}
 	l.Debug("throttler: request completed",
 		slog.Int("statusCode", lw.status),
-		slog.Int("tokens", ct.rateLimiter.tokenCount()),
+		slog.Int("tokens", ct.rateLimiter.TokenCount()),
 	)
 }
 
@@ -142,7 +144,7 @@ func (t *Throttler) getClientThrottler(ctx context.Context, host string) *client
 		t.logger.Debug("throttler: new client", slog.String("host", host))
 		subCtx, cancel := context.WithCancel(ctx)
 		b = &clientThrottler{
-			rateLimiter: newRateLimiter(subCtx, t.capacity, t.interval),
+			rateLimiter: ratelimiter.New(subCtx, t.interval, t.capacity),
 			cancel:      cancel,
 		}
 		t.hosts[host] = b
@@ -183,54 +185,4 @@ type logWriterRecorder struct {
 func (r *logWriterRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
-}
-
-// rateLimiter is a token bucket rate limiter.
-// Unlike a normal token bucket, it does not block when the bucket is empty, as we only use it to
-// decide whether to throttle requests.
-type rateLimiter struct {
-	lock     sync.RWMutex
-	tokens   int
-	capacity int
-}
-
-func newRateLimiter(ctx context.Context, capacity int, interval time.Duration) *rateLimiter {
-	r := rateLimiter{tokens: capacity, capacity: capacity}
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				r.release()
-			}
-		}
-	}()
-	return &r
-}
-
-func (r *rateLimiter) acquire() bool {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	if r.tokens == 0 {
-		return false
-	}
-	r.tokens--
-	return true
-}
-
-func (r *rateLimiter) release() {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	if r.tokens < r.capacity {
-		r.tokens++
-	}
-}
-
-func (r *rateLimiter) tokenCount() int {
-	r.lock.RLock()
-	defer r.lock.RUnlock()
-	return r.tokens
 }
