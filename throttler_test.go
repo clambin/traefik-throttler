@@ -144,21 +144,62 @@ func TestThrottler_Expiration(t *testing.T) {
 
 		// consume all tokens for one client
 		for range tokens {
-			if code := send(ctx, throttler, "127.0.0.1:12345"); code != http.StatusNotFound {
+			if code := send(ctx, throttler, "127.0.0.1:12345/"); code != http.StatusNotFound {
 				t.Fatalf("expected 404, got %d", code)
 			}
 		}
 		// the next request should fail
-		if code := send(ctx, throttler, "127.0.0.1:12345"); code != http.StatusTooManyRequests {
+		if code := send(ctx, throttler, "127.0.0.1:12345/"); code != http.StatusTooManyRequests {
 			t.Fatalf("expected 429, got %d", code)
 		}
 		// wait for hostThrottler to expire
 		time.Sleep(10 * time.Minute)
 		// the next request should succeed
-		if code := send(ctx, throttler, "127.0.0.1:12345"); code != http.StatusNotFound {
+		if code := send(ctx, throttler, "127.0.0.1:12345/"); code != http.StatusNotFound {
 			t.Fatalf("expected 404, got %d", code)
 		}
 	})
+}
+
+func TestThrottler_ReUse_ClientAddr(t *testing.T) {
+	ctx := t.Context()
+	h := handler(http.StatusNotFound)
+
+	const tokens = 5
+	throttler, err := New(ctx, h, config(tokens, 10, "error"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// subContext to simulate a new connection from the same clientAddr
+	subCtx, cancel := context.WithCancel(ctx)
+
+	// consume all tokens for one client
+	for range tokens {
+		if code := send(subCtx, throttler, "127.0.0.1:12345/"); code != http.StatusNotFound {
+			t.Fatalf("expected 404, got %d", code)
+		}
+	}
+	// the next request should fail
+	if code := send(subCtx, throttler, "127.0.0.1:12345/"); code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", code)
+	}
+
+	// connection closed.
+	cancel()
+
+	// new connection: should not be throttled
+	// may take some time for the previous clientThrottler to process the cancellation, so try until we succeed.
+	// it should take less than clientThrottlersExpirationInterval.
+	subCtx, cancel = context.WithCancel(ctx)
+	t.Cleanup(cancel)
+	for {
+		if code := send(subCtx, throttler, "127.0.0.1:12345/"); code == http.StatusNotFound {
+			break
+		}
+		t.Log("waiting for clientThrottler to expire")
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func BenchmarkThrottler(b *testing.B) {

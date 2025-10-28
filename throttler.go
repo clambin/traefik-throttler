@@ -9,17 +9,18 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/clambin/ratelimiter"
 )
 
 const (
-	expireClientThrottlersInterval = 5 * time.Minute
-	defaultCapacity                = 50
-	defaultRate                    = 10
-	defaultLogLevel                = "info"
-	defaultLogFormat               = "json"
+	clientThrottlersExpirationInterval = 30 * time.Second
+	defaultCapacity                    = 50
+	defaultRate                        = 10
+	defaultLogLevel                    = "info"
+	defaultLogFormat                   = "json"
 )
 
 // Config holds the plugin configuration.
@@ -78,13 +79,6 @@ type Throttler struct {
 	capacity         int
 }
 
-// clientThrottler is a rate limiter for a single client.
-type clientThrottler struct {
-	rateLimiter *ratelimiter.RateLimiter
-	cancel      context.CancelFunc
-	lastWritten time.Time
-}
-
 // New creates a new instance of the middleware.
 func New(ctx context.Context, next http.Handler, config *Config, _ string) (http.Handler, error) {
 	logger, err := config.logger(os.Stdout)
@@ -109,7 +103,7 @@ func New(ctx context.Context, next http.Handler, config *Config, _ string) (http
 		// the clientThrottler continues to fill the bucket even if the connection is closed.
 		ct := t.getClientThrottler(ctx, r.RemoteAddr)
 		// get a token from the clientThrottler.  If the token is not available, return a 429.
-		if !ct.rateLimiter.TryAcquire() {
+		if !ct.tryAcquire() {
 			l.Warn("throttler: request throttled")
 			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
 			return
@@ -119,7 +113,7 @@ func New(ctx context.Context, next http.Handler, config *Config, _ string) (http
 		next.ServeHTTP(&lw, r)
 		// if the request was successful, release the token.
 		if lw.status != http.StatusNotFound {
-			ct.rateLimiter.Release()
+			ct.release()
 		}
 		l.Debug("throttler: request completed",
 			slog.Int("statusCode", lw.status),
@@ -134,21 +128,16 @@ func (t *Throttler) getClientThrottler(ctx context.Context, remoteAddr string) *
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	ct, ok := t.clientThrottlers[remoteAddr]
-	if !ok {
+	if !ok || !ct.active() {
 		t.logger.Debug("throttler: new client", slog.String("remoteAddr", remoteAddr))
-		subCtx, cancel := context.WithCancel(ctx)
-		ct = &clientThrottler{
-			rateLimiter: ratelimiter.New(subCtx, t.interval, t.capacity),
-			cancel:      cancel,
-		}
+		ct = newClientThrottler(ctx, t.interval, t.capacity)
 		t.clientThrottlers[remoteAddr] = ct
 	}
-	ct.lastWritten = time.Now()
 	return ct
 }
 
 func (t *Throttler) purgeExpiredClientThrottlers(ctx context.Context) {
-	ticker := time.NewTicker(expireClientThrottlersInterval)
+	ticker := time.NewTicker(clientThrottlersExpirationInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -157,7 +146,7 @@ func (t *Throttler) purgeExpiredClientThrottlers(ctx context.Context) {
 		case <-ticker.C:
 			t.lock.Lock()
 			for host, ct := range t.clientThrottlers {
-				if time.Since(ct.lastWritten) > expireClientThrottlersInterval {
+				if !ct.active() {
 					t.logger.Debug("throttler: expired client", slog.String("host", host))
 					ct.cancel()
 					delete(t.clientThrottlers, host)
@@ -166,6 +155,53 @@ func (t *Throttler) purgeExpiredClientThrottlers(ctx context.Context) {
 			t.lock.Unlock()
 		}
 	}
+}
+
+// clientThrottler is a rate limiter for a single client connection.
+type clientThrottler struct {
+	rateLimiter *ratelimiter.RateLimiter
+	cancel      context.CancelFunc
+	expiration  atomic.Value
+}
+
+func newClientThrottler(ctx context.Context, interval time.Duration, capacity int) *clientThrottler {
+	subCtx, cancel := context.WithCancel(ctx)
+	ct := clientThrottler{
+		rateLimiter: ratelimiter.New(subCtx, interval, capacity),
+		cancel:      cancel,
+	}
+	ct.markActive(true)
+	go func() {
+		// when the context is canceled (i.e., the client disconnects), mark the clientThrottler as inactive.
+		<-subCtx.Done()
+		ct.markActive(false)
+	}()
+	return &ct
+}
+
+func (ct *clientThrottler) tryAcquire() bool {
+	if ct.rateLimiter.TryAcquire() {
+		ct.markActive(true)
+		return true
+	}
+	return false
+}
+
+func (ct *clientThrottler) release() {
+	ct.rateLimiter.Release()
+}
+
+func (ct *clientThrottler) active() bool {
+	expiration, ok := ct.expiration.Load().(time.Time)
+	return ok && time.Until(expiration) > 0
+}
+
+func (ct *clientThrottler) markActive(active bool) {
+	var tm time.Time
+	if active {
+		tm = time.Now().Add(clientThrottlersExpirationInterval)
+	}
+	ct.expiration.Store(tm)
 }
 
 var _ http.ResponseWriter = &logWriterRecorder{}
