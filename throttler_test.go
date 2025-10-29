@@ -32,9 +32,9 @@ func TestConfig_interval(t *testing.T) {
 
 func TestConfig_logger(t *testing.T) {
 	tests := []struct {
-		name    string
-		cfg     LogConfig
-		wantErr bool
+		name     string
+		cfg      LogConfig
+		wantPass bool
 	}{
 		{"json - valid", LogConfig{Level: "error", Format: "json"}, true},
 		{"text - valid", LogConfig{Level: "error", Format: "text"}, true},
@@ -44,8 +44,8 @@ func TestConfig_logger(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := Config{Log: tt.cfg}.logger(io.Discard)
-			if (err != nil) == tt.wantErr {
-				t.Errorf("logger() error = %v, wantErr %v", err, tt.wantErr)
+			if (err != nil) == tt.wantPass {
+				t.Errorf("logger() error = %v, wantPass %v", err, tt.wantPass)
 			}
 		})
 	}
@@ -63,18 +63,13 @@ func TestThrottler(t *testing.T) {
 
 	// consume all tokens for one client
 	for range tokens {
-		if code := send(ctx, throttler, "127.0.0.1:12345"); code != http.StatusNotFound {
-			t.Fatalf("expected 404, got %d", code)
-		}
+		expectStatus(t, http.StatusNotFound, send(ctx, throttler, "127.0.0.1:12345"))
 	}
 	// the next request should fail
-	if code := send(ctx, throttler, "127.0.0.1:12345"); code != http.StatusTooManyRequests {
-		t.Fatalf("expected 429, got %d", code)
-	}
+	expectStatus(t, http.StatusTooManyRequests, send(ctx, throttler, "127.0.0.1:12345"))
+
 	// different client should be able to make requests
-	if code := send(ctx, throttler, "127.0.0.1:12346"); code != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d", code)
-	}
+	expectStatus(t, http.StatusNotFound, send(ctx, throttler, "127.0.0.1:12346"))
 }
 
 func TestThrottler_NoNotFound(t *testing.T) {
@@ -88,9 +83,7 @@ func TestThrottler_NoNotFound(t *testing.T) {
 	}
 	// status OK does not trigger 429
 	for range 20 * tokens {
-		if code := send(ctx, throttler, "127.0.0.1:12345"); code != http.StatusOK {
-			t.Fatalf("expected 404, got %d", code)
-		}
+		expectStatus(t, http.StatusOK, send(ctx, throttler, "127.0.0.1:12345"))
 	}
 }
 
@@ -99,31 +92,23 @@ func TestThrottler_Refill(t *testing.T) {
 		ctx := t.Context()
 		h := handler(http.StatusNotFound)
 		const (
-			tokens             = 5
-			expirationInterval = time.Second
+			tokens   = 5
+			interval = time.Second
 		)
-
-		throttler, err := New(ctx, h, &Config{Capacity: 5, Rate: 1 / expirationInterval.Seconds(), Log: LogConfig{Level: "error"}}, "")
+		throttler, err := New(ctx, h, &Config{Capacity: 5, Rate: 1 / interval.Seconds(), Log: LogConfig{Level: "error"}}, "")
 		if err != nil {
 			t.Fatal(err)
 		}
-
 		// consume all tokens for one client
 		for range tokens {
-			if code := send(ctx, throttler, "127.0.0.1:12345"); code != http.StatusNotFound {
-				t.Fatalf("expected 404, got %d", code)
-			}
+			expectStatus(t, http.StatusNotFound, send(ctx, throttler, "127.0.0.1:12345"))
 		}
 		// the next request should fail
-		if code := send(ctx, throttler, "127.0.0.1:12345"); code != http.StatusTooManyRequests {
-			t.Fatalf("expected 429, got %d", code)
-		}
+		expectStatus(t, http.StatusTooManyRequests, send(ctx, throttler, "127.0.0.1:12345"))
 		// wait for tokens to be refilled
-		time.Sleep(2 * expirationInterval)
+		time.Sleep(2 * interval)
 		// the next request should succeed
-		if code := send(ctx, throttler, "127.0.0.1:12345"); code != http.StatusNotFound {
-			t.Fatalf("expected 404, got %d", code)
-		}
+		expectStatus(t, http.StatusNotFound, send(ctx, throttler, "127.0.0.1:12345"))
 	})
 }
 
@@ -131,40 +116,31 @@ func TestThrottler_Expiration(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := t.Context()
 		h := handler(http.StatusNotFound)
-
 		const (
-			tokens             = 5
-			expirationInterval = time.Second
+			tokens   = 5
+			interval = time.Second
 		)
-
-		throttler, err := New(ctx, h, config(tokens, 1/expirationInterval.Seconds(), "error"), "")
+		throttler, err := New(ctx, h, config(tokens, 1/interval.Seconds(), "error"), "")
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		// consume all tokens for one client
 		for range tokens {
-			if code := send(ctx, throttler, "127.0.0.1:12345/"); code != http.StatusNotFound {
-				t.Fatalf("expected 404, got %d", code)
-			}
+			expectStatus(t, http.StatusNotFound, send(ctx, throttler, "127.0.0.1:12345"))
 		}
 		// the next request should fail
-		if code := send(ctx, throttler, "127.0.0.1:12345/"); code != http.StatusTooManyRequests {
-			t.Fatalf("expected 429, got %d", code)
-		}
+		expectStatus(t, http.StatusTooManyRequests, send(ctx, throttler, "127.0.0.1:12345"))
 		// wait for hostThrottler to expire
-		time.Sleep(10 * time.Minute)
+		time.Sleep(2 * clientThrottlersExpirationInterval)
 		// the next request should succeed
-		if code := send(ctx, throttler, "127.0.0.1:12345/"); code != http.StatusNotFound {
-			t.Fatalf("expected 404, got %d", code)
-		}
+		expectStatus(t, http.StatusNotFound, send(ctx, throttler, "127.0.0.1:12345"))
 	})
 }
 
 func TestThrottler_ReUse_ClientAddr(t *testing.T) {
 	ctx := t.Context()
 	h := handler(http.StatusNotFound)
-
 	const tokens = 5
 	throttler, err := New(ctx, h, config(tokens, 10, "error"), "")
 	if err != nil {
@@ -173,32 +149,39 @@ func TestThrottler_ReUse_ClientAddr(t *testing.T) {
 
 	// subContext to simulate a new connection from the same clientAddr
 	subCtx, cancel := context.WithCancel(ctx)
-
 	// consume all tokens for one client
 	for range tokens {
-		if code := send(subCtx, throttler, "127.0.0.1:12345/"); code != http.StatusNotFound {
-			t.Fatalf("expected 404, got %d", code)
-		}
+		expectStatus(t, http.StatusNotFound, send(subCtx, throttler, "127.0.0.1:12345"))
 	}
 	// the next request should fail
-	if code := send(subCtx, throttler, "127.0.0.1:12345/"); code != http.StatusTooManyRequests {
-		t.Fatalf("expected 429, got %d", code)
-	}
-
+	expectStatus(t, http.StatusTooManyRequests, send(subCtx, throttler, "127.0.0.1:12345"))
 	// connection closed.
 	cancel()
-
 	// new connection: should not be throttled
 	// may take some time for the previous clientThrottler to process the cancellation, so try until we succeed.
 	// it should take less than clientThrottlersExpirationInterval.
 	subCtx, cancel = context.WithCancel(ctx)
 	t.Cleanup(cancel)
 	for {
-		if code := send(subCtx, throttler, "127.0.0.1:12345/"); code == http.StatusNotFound {
+		if code := send(subCtx, throttler, "127.0.0.1:12345"); code == http.StatusNotFound {
 			break
 		}
 		t.Log("waiting for clientThrottler to expire")
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestClientThrottler_Active(t *testing.T) {
+	ctx := context.Background()
+	ct := newClientThrottler(ctx, time.Second, 1)
+
+	if !ct.active() {
+		t.Fatal("expected active immediately after creation")
+	}
+
+	ct.markActive(false)
+	if ct.active() {
+		t.Fatal("expected inactive after markActive(false)")
 	}
 }
 
@@ -213,6 +196,12 @@ func BenchmarkThrottler(b *testing.B) {
 	for b.Loop() {
 		send(ctx, throttler, "127.0.0.1:12345")
 	}
+}
+
+func handler(code int) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(code)
+	})
 }
 
 func config(capacity int, rate float64, level string) *Config {
@@ -233,8 +222,9 @@ func send(ctx context.Context, h http.Handler, clientAddr string) int {
 	return resp.Code
 }
 
-func handler(code int) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(code)
-	})
+func expectStatus(tb testing.TB, want, got int) {
+	tb.Helper()
+	if got != want {
+		tb.Fatalf("expected %d, got %d", want, got)
+	}
 }

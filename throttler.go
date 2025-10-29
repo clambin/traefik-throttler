@@ -36,10 +36,11 @@ type LogConfig struct {
 }
 
 func (c Config) interval() time.Duration {
-	if c.Rate == 0 {
-		c.Rate = 1.0
+	rate := c.Rate
+	if rate <= 0 {
+		rate = 1.0
 	}
-	return time.Duration(float64(time.Second) / c.Rate)
+	return time.Duration(float64(time.Second) / rate)
 }
 
 func (c Config) logger(w io.Writer) (*slog.Logger, error) {
@@ -111,9 +112,9 @@ func New(ctx context.Context, next http.Handler, config *Config, _ string) (http
 		// we're not throttled.  Perform the request.
 		lw := logWriterRecorder{ResponseWriter: w}
 		next.ServeHTTP(&lw, r)
-		// if the request was successful, release the token.
+		// if the request was successful, restore the token so the rate limit will not apply.
 		if lw.status != http.StatusNotFound {
-			ct.release()
+			ct.restore()
 		}
 		l.Debug("throttler: request completed",
 			slog.Int("statusCode", lw.status),
@@ -148,8 +149,8 @@ func (t *Throttler) purgeExpiredClientThrottlers(ctx context.Context) {
 			for host, ct := range t.clientThrottlers {
 				if !ct.active() {
 					t.logger.Debug("throttler: expired client", slog.String("host", host))
-					ct.cancel()
 					delete(t.clientThrottlers, host)
+					ct.cancel()
 				}
 			}
 			t.lock.Unlock()
@@ -187,7 +188,7 @@ func (ct *clientThrottler) tryAcquire() bool {
 	return false
 }
 
-func (ct *clientThrottler) release() {
+func (ct *clientThrottler) restore() {
 	ct.rateLimiter.Release()
 }
 
@@ -215,4 +216,11 @@ type logWriterRecorder struct {
 func (r *logWriterRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *logWriterRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
 }
