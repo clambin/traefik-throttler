@@ -73,7 +73,6 @@ func CreateConfig() *Config {
 
 // Throttler is a Traefik plugin that throttles requests for clients that generate too many 404 errors.
 type Throttler struct {
-	logger           *slog.Logger
 	clientThrottlers map[string]*clientThrottler
 	lock             sync.Mutex
 	interval         time.Duration
@@ -87,22 +86,21 @@ func New(ctx context.Context, next http.Handler, config *Config, _ string) (http
 		return nil, fmt.Errorf("slog: %w", err)
 	}
 	t := Throttler{
-		logger:           logger,
 		clientThrottlers: make(map[string]*clientThrottler),
 		interval:         config.interval(),
 		capacity:         config.Capacity,
 	}
-	go t.purgeExpiredClientThrottlers(ctx)
+	go t.purgeExpiredClientThrottlers(ctx, logger)
 
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		l := t.logger.With(
+		l := logger.With(
 			slog.String("remoteAddr", r.RemoteAddr),
 			slog.String("path", r.URL.Path),
 		)
 		l.Debug("throttler: new request")
 		// start (or get) the clientThrottler for the current client.  We don't use r.Context() here to ensure that
 		// the clientThrottler continues to fill the bucket even if the connection is closed.
-		ct := t.getClientThrottler(ctx, r.RemoteAddr)
+		ct := t.getClientThrottler(ctx, r.RemoteAddr, l)
 		// get a token from the clientThrottler.  If the token is not available, return a 429.
 		if !ct.tryAcquire() {
 			l.Warn("throttler: request throttled")
@@ -110,7 +108,7 @@ func New(ctx context.Context, next http.Handler, config *Config, _ string) (http
 			return
 		}
 		// we're not throttled.  Perform the request.
-		lw := logWriterRecorder{ResponseWriter: w}
+		lw := loggingResponseWriter{ResponseWriter: w}
 		next.ServeHTTP(&lw, r)
 		// if the request was successful, restore the token so the rate limit will not apply.
 		if lw.status != http.StatusNotFound {
@@ -125,19 +123,19 @@ func New(ctx context.Context, next http.Handler, config *Config, _ string) (http
 	return h, nil
 }
 
-func (t *Throttler) getClientThrottler(ctx context.Context, remoteAddr string) *clientThrottler {
+func (t *Throttler) getClientThrottler(ctx context.Context, remoteAddr string, logger *slog.Logger) *clientThrottler {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	ct, ok := t.clientThrottlers[remoteAddr]
 	if !ok || !ct.active() {
-		t.logger.Debug("throttler: new client", slog.String("remoteAddr", remoteAddr))
+		logger.Debug("throttler: allocating new client throttler")
 		ct = newClientThrottler(ctx, t.interval, t.capacity)
 		t.clientThrottlers[remoteAddr] = ct
 	}
 	return ct
 }
 
-func (t *Throttler) purgeExpiredClientThrottlers(ctx context.Context) {
+func (t *Throttler) purgeExpiredClientThrottlers(ctx context.Context, logger *slog.Logger) {
 	ticker := time.NewTicker(clientThrottlersExpirationInterval)
 	defer ticker.Stop()
 	for {
@@ -148,7 +146,7 @@ func (t *Throttler) purgeExpiredClientThrottlers(ctx context.Context) {
 			t.lock.Lock()
 			for host, ct := range t.clientThrottlers {
 				if !ct.active() {
-					t.logger.Debug("throttler: expired client", slog.String("host", host))
+					logger.Debug("throttler: expired client", slog.String("host", host))
 					delete(t.clientThrottlers, host)
 					ct.cancel()
 				}
@@ -205,22 +203,15 @@ func (ct *clientThrottler) markActive(active bool) {
 	ct.expiration.Store(tm)
 }
 
-var _ http.ResponseWriter = &logWriterRecorder{}
+var _ http.ResponseWriter = &loggingResponseWriter{}
 
-// logWriterRecorder is an http.ResponseWriter that records the status code.
-type logWriterRecorder struct {
+// loggingResponseWriter is an http.ResponseWriter that records the status code.
+type loggingResponseWriter struct {
 	http.ResponseWriter
 	status int
 }
 
-func (r *logWriterRecorder) WriteHeader(status int) {
+func (r *loggingResponseWriter) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
-}
-
-func (r *logWriterRecorder) Write(b []byte) (int, error) {
-	if r.status == 0 {
-		r.status = http.StatusOK
-	}
-	return r.ResponseWriter.Write(b)
 }

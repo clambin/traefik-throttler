@@ -18,7 +18,7 @@ func New(ctx context.Context, interval time.Duration, capacity int) *RateLimiter
 	}
 
 	// Fill the bucket initially
-	for i := 0; i < capacity; i++ {
+	for range capacity {
 		rl.tokens <- struct{}{}
 	}
 
