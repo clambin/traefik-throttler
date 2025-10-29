@@ -4,9 +4,11 @@
 [![codecov](https://img.shields.io/codecov/c/gh/clambin/traefik-throttler?style=plastic)](https://app.codecov.io/gh/clambin/throttler)
 [![license](https://img.shields.io/github/license/clambin/tado-exporter?style=plastic)](LICENSE.md)
 
-traefik-throttler throttles clients that generate too many 404 errors.
+This Traefik plugin throttles clients that generate too many 404 errors.
 
-## Installation
+## Configuration
+
+### Static
 
 Add the plugin to your Traefik static configuration:
 
@@ -15,56 +17,43 @@ experimental:
   plugins:
     throttler:
       moduleName: "github.com/clambin/traefik-throttler"
-      version: "v0.2.0"
+      version: "v0.2.3"
 ```
 
-## Configuration
+### Dynamic
 
-Create a middleware for the plugin. E.g. in kubernetes:
+Create a [middleware](https://docs.traefik.io/middlewares/overview/) in your dynamic configuration and
+add it to your router(s).
 
-```yaml
-apiVersion: traefik.io/v1alpha1
-kind: Middleware
-metadata:
-  name: throttler
-spec:
-  plugin:
-    throttler:
-      # Throttler uses a token bucket to throttle clients that generate too many 404 errors.
-      # capacity is the number of 404 errors to allow before throttling (default: 50)
-      capacity: 10
-      # rate allows 404 errors while throttling (default: 1 req/sec)
-      rate: 5
-      log:
-        # logging format (json/text; default: text)
-        format: json
-        # logging level (debug/info/warn/error; default: info)
-        level: debug
-```
-
-Next, add the middleware to your router(s). E.g., in kubernetes:
+The following example creates and uses the plugin to block requests after ten 404 errors, 
+with an allowed error rate of two request per second.
 
 ```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: my-route
-spec:
-  parentRefs:
-  - name: traefik-gateway
-    sectionName: websecure
-  hostnames:
-  - www.example.com
-  rules:
-  - backendRefs:
-    - name: my-service
-      port: 80
-    filters:
-    - type: ExtensionRef
-      extensionRef:
-        group: traefik.io
-        kind: Middleware
-        name: throttler
+http:
+  middlewares:
+    throttler-foo:
+      throttler:
+        # Throttler uses a token bucket to throttle clients that generate too many 404 errors.
+        # capacity is the number of 404 errors to allow before throttling (default: 50)
+        capacity: 10
+        # rate allows 404 errors while throttling (default: 1 req/sec)
+        rate: 2
+        log:
+          # logging format (json/text; default: text)
+          format: json
+          # logging level (debug/info/warn/error; default: info)
+          level: debug
+  routers:
+    my-router:
+      rule: "Host(`example.com`)"
+      service: my-service
+      middlewares:
+        - throttler-foo
+  services:
+    my-service:
+      loadBalancer:
+        servers:
+          - url: "http://localhost:8080"
 ```
 
 ## Authors
@@ -73,4 +62,4 @@ spec:
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE.md](LICENSE.md) file for details.
+This project is licensed under the [MIT](LICENSE.md) license.
