@@ -11,8 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"codeberg.org/clambin/ratelimiter"
 )
 
 const (
@@ -158,7 +156,7 @@ func (t *Throttler) purgeExpiredClientThrottlers(ctx context.Context, logger *sl
 
 // clientThrottler is a rate limiter for a single client connection.
 type clientThrottler struct {
-	rateLimiter *ratelimiter.RateLimiter
+	rateLimiter *RateLimiter
 	cancel      context.CancelFunc
 	expiration  atomic.Value
 }
@@ -166,7 +164,7 @@ type clientThrottler struct {
 func newClientThrottler(ctx context.Context, interval time.Duration, capacity int) *clientThrottler {
 	subCtx, cancel := context.WithCancel(ctx)
 	ct := clientThrottler{
-		rateLimiter: ratelimiter.New(subCtx, interval, capacity),
+		rateLimiter: NewRateLimiter(subCtx, interval, capacity),
 		cancel:      cancel,
 	}
 	ct.markActive(true)

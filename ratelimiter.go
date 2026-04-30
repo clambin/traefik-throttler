@@ -1,4 +1,4 @@
-package ratelimiter
+package traefik_throttler
 
 import (
 	"context"
@@ -10,14 +10,15 @@ type RateLimiter struct {
 	tokens chan struct{}
 }
 
-// New returns a new RateLimiter.
+// NewRateLimiter returns a new RateLimiter.
 // Tokens are refilled at the given interval, up to the given capacity until the context is canceled.
-func New(ctx context.Context, interval time.Duration, capacity int) *RateLimiter {
+func NewRateLimiter(ctx context.Context, interval time.Duration, capacity int) *RateLimiter {
 	rl := &RateLimiter{
 		tokens: make(chan struct{}, capacity),
 	}
 
 	// Fill the bucket initially
+	// note: yaegi is basically stuck on Go 1.22(ish), so can't use modern constructs like `for range` or generics.
 	for i := 0; i < capacity; i++ {
 		rl.tokens <- struct{}{}
 	}
